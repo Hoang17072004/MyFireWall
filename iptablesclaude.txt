@@ -1,0 +1,117 @@
+#!/bin/bash
+#
+# iptables-protect.sh
+# Mode: DETECTION + SELECTIVE BLOCKING
+# - Whitelist traffic toi/tu Splunk server (khong bi rate-limit/log nhieu)
+# - Log cac hanh vi kha nghi qua NFLOG (de ulogd ghi file / forward Splunk)
+# - DROP that cho cac case ro rang la tan cong (invalid TCP flags)
+# - Rate-limit that cho SSH brute-force va port scan (khong chi log suong)
+#
+IPTABLES="iptables"
+NFLOG_GROUP="1"
+ 
+# ============================================================
+# CAU HINH - chinh theo moi truong that
+# ============================================================
+SPLUNK_SERVER="192.168.10.1"     # IP server Splunk (indexer)
+SPLUNK_PORTS="9997,8089"         # port nhan log + port quan ly
+SSH_PORT="22"
+SSH_MAX_HITS="10"                # so lan thu trong khoang thoi gian
+SSH_WINDOW_SECONDS="60"          # khoang thoi gian tinh (giay)
+CONNLIMIT_PER_IP="111"           # so connection dong thoi toi da / IP
+NEW_CONN_RATE="60/second"        # rate NEW connection toi da / IP
+NEW_CONN_BURST="20"
+PORT_SCAN_RATE="10/second"
+PORT_SCAN_BURST="20"
+ 
+# REQUIRE ROOT
+if [ "$EUID" -ne 0 ]; then
+  echo "Run as root: sudo bash $0"
+  exit 1
+fi
+ 
+echo "[+] Configuring iptables..."
+echo "[+] Mode: DETECTION + SELECTIVE BLOCKING"
+echo "[+] Splunk server whitelisted: $SPLUNK_SERVER ($SPLUNK_PORTS)"
+echo "[+] NFLOG group: $NFLOG_GROUP"
+ 
+# RESET
+$IPTABLES -F ; $IPTABLES -X
+$IPTABLES -t nat -F ; $IPTABLES -t nat -X
+$IPTABLES -t mangle -F ; $IPTABLES -t mangle -X
+$IPTABLES -t raw -F ; $IPTABLES -t raw -X
+ 
+# DEFAULT POLICY
+$IPTABLES -P INPUT ACCEPT
+$IPTABLES -P FORWARD ACCEPT
+$IPTABLES -P OUTPUT ACCEPT
+ 
+# 0. WHITELIST Splunk server (luon uu tien, dat tren cung)
+$IPTABLES -A INPUT -p tcp -s "$SPLUNK_SERVER" -m multiport --sports "$SPLUNK_PORTS" -j ACCEPT
+$IPTABLES -A OUTPUT -p tcp -d "$SPLUNK_SERVER" -m multiport --dports "$SPLUNK_PORTS" -j ACCEPT
+$IPTABLES -A INPUT -s "$SPLUNK_SERVER" -j ACCEPT
+ 
+# LOOPBACK + ESTABLISHED/RELATED
+$IPTABLES -A INPUT -i lo -j ACCEPT
+$IPTABLES -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ 
+# 1. CONNECTION LIMIT - log + DROP neu vuot nguong
+$IPTABLES -A INPUT -p tcp -m connlimit --connlimit-above "$CONNLIMIT_PER_IP" --connlimit-mask 32 \
+  -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_CONN_LIMIT: "
+$IPTABLES -A INPUT -p tcp -m connlimit --connlimit-above "$CONNLIMIT_PER_IP" --connlimit-mask 32 -j DROP
+ 
+# 2. TCP RST RATE - chi log
+$IPTABLES -A INPUT -p tcp --tcp-flags RST RST -m limit --limit 2/second --limit-burst 2 \
+  -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_RST_RATE: "
+ 
+# 3. TCP NEW CONNECTION RATE - log + DROP neu vuot nguong
+$IPTABLES -A INPUT -p tcp -m conntrack --ctstate NEW -m hashlimit --hashlimit-name tcp_new_per_src \
+  --hashlimit-above "$NEW_CONN_RATE" --hashlimit-burst "$NEW_CONN_BURST" --hashlimit-mode srcip \
+  -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_NEW_TCP_RATE: "
+$IPTABLES -A INPUT -p tcp -m conntrack --ctstate NEW -m hashlimit --hashlimit-name tcp_new_per_src_drop \
+  --hashlimit-above "$NEW_CONN_RATE" --hashlimit-burst "$NEW_CONN_BURST" --hashlimit-mode srcip -j DROP
+ 
+# 4. SSH BRUTE FORCE - log + DROP that khi vuot nguong
+$IPTABLES -A INPUT -p tcp --dport "$SSH_PORT" -m conntrack --ctstate NEW -m recent --name SSH_BRUTE --set
+$IPTABLES -A INPUT -p tcp --dport "$SSH_PORT" -m conntrack --ctstate NEW -m recent --name SSH_BRUTE \
+  --update --seconds "$SSH_WINDOW_SECONDS" --hitcount "$SSH_MAX_HITS" \
+  -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_SSH_BRUTEFORCE: "
+$IPTABLES -A INPUT -p tcp --dport "$SSH_PORT" -m conntrack --ctstate NEW -m recent --name SSH_BRUTE \
+  --update --seconds "$SSH_WINDOW_SECONDS" --hitcount "$SSH_MAX_HITS" -j DROP
+ 
+# 5. TCP PORT SCAN / SYN DETECTION - log + DROP khi vuot nguong
+$IPTABLES -N port-scanning 2>/dev/null || true
+$IPTABLES -F port-scanning
+$IPTABLES -A port-scanning -p tcp --tcp-flags SYN,ACK,FIN,RST SYN -m limit \
+  --limit "$PORT_SCAN_RATE" --limit-burst "$PORT_SCAN_BURST" \
+  -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_PORT_SCAN: "
+$IPTABLES -A port-scanning -p tcp --tcp-flags SYN,ACK,FIN,RST SYN -m limit \
+  --limit "$PORT_SCAN_RATE" --limit-burst "$PORT_SCAN_BURST" -j RETURN
+$IPTABLES -A port-scanning -p tcp --tcp-flags SYN,ACK,FIN,RST SYN -j DROP
+$IPTABLES -A port-scanning -j RETURN
+$IPTABLES -A INPUT -j port-scanning
+ 
+# 6. SUSPICIOUS TCP FLAGS - luon sai giao thuc -> DROP thang
+$IPTABLES -A INPUT -p tcp --tcp-flags ALL NONE -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_TCP_NULL: "
+$IPTABLES -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
+$IPTABLES -A INPUT -p tcp --tcp-flags SYN,FIN SYN,FIN -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_SYN_FIN: "
+$IPTABLES -A INPUT -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP
+$IPTABLES -A INPUT -p tcp --tcp-flags SYN,RST SYN,RST -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_SYN_RST: "
+$IPTABLES -A INPUT -p tcp --tcp-flags SYN,RST SYN,RST -j DROP
+$IPTABLES -A INPUT -p tcp --tcp-flags FIN,RST FIN,RST -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_FIN_RST: "
+$IPTABLES -A INPUT -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+$IPTABLES -A INPUT -p tcp --tcp-flags FIN,PSH,URG FIN,PSH,URG -j NFLOG --nflog-group "$NFLOG_GROUP" --nflog-prefix "IPTABLES_FIN_PSH_URG: "
+$IPTABLES -A INPUT -p tcp --tcp-flags FIN,PSH,URG FIN,PSH,URG -j DROP
+ 
+echo "============================================================"
+echo "iptables configuration completed"
+echo "Splunk server      : $SPLUNK_SERVER ($SPLUNK_PORTS) - whitelisted"
+echo "Default policy     : ACCEPT"
+echo "Suspicious TCP flags: DROP (NULL/SYN+FIN/SYN+RST/FIN+RST/Xmas)"
+echo "SSH brute-force     : DROP sau $SSH_MAX_HITS lan / $SSH_WINDOW_SECONDS s"
+echo "Port scan           : DROP khi vuot $PORT_SCAN_RATE"
+echo "NEW conn rate/IP     : DROP khi vuot $NEW_CONN_RATE"
+echo "Connlimit/IP         : DROP khi vuot $CONNLIMIT_PER_IP"
+echo "============================================================"
+ 
+$IPTABLES -L -n -v --line-numbers
